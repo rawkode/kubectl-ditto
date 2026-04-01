@@ -54,15 +54,17 @@ jobs:
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
+          cp LICENSE target/${{ matrix.target }}/release/
           cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.archive }} kubectl-ditto
+          tar czf ../../../${{ matrix.archive }} kubectl-ditto LICENSE
         shell: bash
 
       - name: Package (windows)
         if: runner.os == 'Windows'
         run: |
+          cp LICENSE target/${{ matrix.target }}/release/
           cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.archive }} kubectl-ditto.exe
+          tar czf ../../../${{ matrix.archive }} kubectl-ditto.exe LICENSE
         shell: bash
 
       - uses: actions/upload-artifact@v4
