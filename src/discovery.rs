@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use kube::Client;
 use serde::Deserialize;
 
@@ -91,10 +91,10 @@ pub async fn resolve_resource(client: &Client, input: &str) -> Result<ResolvedRe
 
     for res in &all_resources {
         // If user specified a group, filter to it
-        if let Some(ref sg) = search_group {
-            if res.group.to_lowercase() != *sg {
-                continue;
-            }
+        if let Some(ref sg) = search_group
+            && res.group.to_lowercase() != *sg
+        {
+            continue;
         }
 
         let is_match = match (&search_name, &search_group) {

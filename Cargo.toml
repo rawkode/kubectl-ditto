@@ -12,7 +12,7 @@ name = "kubectl-ditto"
 path = "src/main.rs"
 
 [dependencies]
-argh = "0.1"
+clap = { version = "4", features = ["derive"] }
 kube = { version = "0.98", features = ["client", "runtime", "derive"] }
 k8s-openapi = { version = "0.24", features = ["latest"] }
 tokio = { version = "1", features = ["full"] }

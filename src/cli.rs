@@ -1,37 +1,36 @@
-use argh::FromArgs;
+use clap::Parser;
 
 /// Generate YAML for any Kubernetes resource or CRD using cluster schema and smart defaults.
-#[derive(FromArgs, Debug)]
+#[derive(Parser, Debug)]
+#[command(name = "kubectl-ditto", version)]
 pub struct Args {
-    /// resource type (e.g. deployment, svc, certificates.cert-manager.io)
-    #[argh(positional)]
-    pub resource: String,
+    /// Resource type (e.g. deployment, svc, certificates.cert-manager.io)
+    pub resource: Option<String>,
 
-    /// resource name
-    #[argh(positional)]
+    /// Resource name
     pub name: Option<String>,
 
-    /// namespace for the resource (omit for cluster-scoped resources)
-    #[argh(option, short = 'n')]
+    /// Namespace for the resource (omit for cluster-scoped resources)
+    #[arg(short, long)]
     pub namespace: Option<String>,
 
-    /// output only required fields (skip optional fields with defaults)
-    #[argh(switch)]
+    /// Output only required fields (skip optional fields with defaults)
+    #[arg(long)]
     pub minimal: bool,
 
-    /// include all optional fields with their defaults
-    #[argh(switch)]
+    /// Include all optional fields with their defaults
+    #[arg(long)]
     pub full: bool,
 
-    /// interactively prompt for required field values
-    #[argh(switch, short = 'i')]
+    /// Interactively prompt for required field values
+    #[arg(short, long)]
     pub interactive: bool,
 
-    /// suppress description comments in output
-    #[argh(switch)]
+    /// Suppress description comments in output
+    #[arg(long)]
     pub no_comments: bool,
 
-    /// dump the raw OpenAPI schema JSON for the resource (debug)
-    #[argh(switch)]
+    /// Dump the raw OpenAPI schema JSON for the resource (debug)
+    #[arg(long)]
     pub dump_schema: bool,
 }

@@ -44,11 +44,7 @@ fn prompt_field(
         return Ok(None);
     }
 
-    let req_marker = if field.required {
-        " (required)"
-    } else {
-        ""
-    };
+    let req_marker = if field.required { " (required)" } else { "" };
 
     // Show description if available
     if let Some(ref desc) = field.description {
@@ -158,10 +154,7 @@ fn prompt_field(
             }
         }
         FieldType::Object(sub_fields) if !sub_fields.is_empty() && depth < 2 => {
-            eprintln!(
-                "  {}",
-                header.apply_to(format!("── {} ──", field.name))
-            );
+            eprintln!("  {}", header.apply_to(format!("── {} ──", field.name)));
 
             let mut map = serde_json::Map::new();
             for sub in sub_fields {

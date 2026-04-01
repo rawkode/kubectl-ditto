@@ -5,14 +5,24 @@ mod interactive;
 mod schema;
 
 use anyhow::Result;
+use clap::Parser;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args: cli::Args = argh::from_env();
+    let args = cli::Args::parse();
+
+    let resource = match &args.resource {
+        Some(r) => r.clone(),
+        None => {
+            cli::Args::parse_from(["kubectl-ditto", "--help"]);
+            unreachable!()
+        }
+    };
+
     let client = kube::Client::try_default().await?;
 
     // 1. Resolve the resource type (dynamic short names from API server)
-    let resolved = discovery::resolve_resource(&client, &args.resource).await?;
+    let resolved = discovery::resolve_resource(&client, &resource).await?;
 
     // 2. Dump raw schema if requested (debug)
     if args.dump_schema {

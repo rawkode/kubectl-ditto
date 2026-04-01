@@ -53,13 +53,7 @@ pub fn generate_yaml(
                 "apiVersion" | "kind" | "metadata" | "status"
             )
         })
-        .filter(|f| {
-            if minimal {
-                f.required
-            } else {
-                true
-            }
-        })
+        .filter(|f| if minimal { f.required } else { true })
         .collect();
 
     // If interactive, prompt for values
@@ -115,30 +109,36 @@ fn write_field(
             || matches!(&field.field_type, FieldType::Array(_));
 
         if !is_empty_default || !has_sub_fields {
-            write_value_at_key(out, &field.name, default, field.description.as_deref(), indent);
+            write_value_at_key(
+                out,
+                &field.name,
+                default,
+                field.description.as_deref(),
+                indent,
+            );
             return;
         }
     }
 
     // Handle enum: use first value
-    if let Some(ref enum_vals) = field.enum_values {
-        if let Some(first) = enum_vals.first() {
-            let comment = field.description.as_ref().map(|d| {
-                let options: Vec<String> = enum_vals
-                    .iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                    .collect();
-                format!("{} (options: {})", d, options.join(", "))
-            });
-            write_value_at_key(
-                out,
-                &field.name,
-                first,
-                comment.as_deref().or(field.description.as_deref()),
-                indent,
-            );
-            return;
-        }
+    if let Some(ref enum_vals) = field.enum_values
+        && let Some(first) = enum_vals.first()
+    {
+        let comment = field.description.as_ref().map(|d| {
+            let options: Vec<String> = enum_vals
+                .iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            format!("{} (options: {})", d, options.join(", "))
+        });
+        write_value_at_key(
+            out,
+            &field.name,
+            first,
+            comment.as_deref().or(field.description.as_deref()),
+            indent,
+        );
+        return;
     }
 
     match &field.field_type {
@@ -152,7 +152,12 @@ fn write_field(
             } else {
                 "\"\""
             };
-            out.field_raw(&field.name, placeholder, field.description.as_deref(), indent);
+            out.field_raw(
+                &field.name,
+                placeholder,
+                field.description.as_deref(),
+                indent,
+            );
         }
         FieldType::Integer => {
             out.field_raw(&field.name, "0", field.description.as_deref(), indent);
@@ -399,13 +404,7 @@ impl YamlWriter {
     }
 
     /// Write a key-value field with a raw (unquoted) value.
-    fn field_raw(
-        &mut self,
-        key: &str,
-        raw_value: &str,
-        description: Option<&str>,
-        indent: usize,
-    ) {
+    fn field_raw(&mut self, key: &str, raw_value: &str, description: Option<&str>, indent: usize) {
         self.field(key, raw_value, description, indent);
     }
 
@@ -415,8 +414,7 @@ impl YamlWriter {
         if let Some(desc) = description {
             if self.include_comments {
                 let short = first_sentence(desc);
-                self.lines
-                    .push(format!("{}{}:  # {}", prefix, key, short));
+                self.lines.push(format!("{}{}:  # {}", prefix, key, short));
             } else {
                 self.lines.push(format!("{}{}:", prefix, key));
             }
@@ -431,8 +429,7 @@ impl YamlWriter {
         if let Some(desc) = description {
             if self.include_comments {
                 let short = first_sentence(desc);
-                self.lines
-                    .push(format!("{}- {}: ", prefix, key));
+                self.lines.push(format!("{}- {}: ", prefix, key));
                 // Comment on previous line would be awkward, skip for array items
                 let _ = short;
             } else {

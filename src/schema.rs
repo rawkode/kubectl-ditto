@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use kube::Client;
 use openapiv3 as oa;
 use serde_json::Value;
@@ -49,10 +49,7 @@ pub struct ResourceSchema {
 // ---------------------------------------------------------------------------
 
 /// Fetch the raw OpenAPI schema definition for a resource (for debugging).
-pub async fn fetch_raw_schema(
-    client: &Client,
-    resolved: &ResolvedResource,
-) -> Result<Value> {
+pub async fn fetch_raw_schema(client: &Client, resolved: &ResolvedResource) -> Result<Value> {
     let spec = fetch_gv_spec_json(client, resolved).await?;
     let schemas = spec
         .get("components")
@@ -68,10 +65,7 @@ pub async fn fetch_raw_schema(
 }
 
 /// Fetch the schema for a resolved resource. Tries OpenAPI v3 first, falls back to v2.
-pub async fn fetch_schema(
-    client: &Client,
-    resolved: &ResolvedResource,
-) -> Result<ResourceSchema> {
+pub async fn fetch_schema(client: &Client, resolved: &ResolvedResource) -> Result<ResourceSchema> {
     if let Ok(schema) = fetch_schema_v3(client, resolved).await {
         return Ok(schema);
     }
@@ -83,10 +77,7 @@ pub async fn fetch_schema(
 // ---------------------------------------------------------------------------
 
 /// Fetch the per-group-version OpenAPI v3 spec as raw JSON.
-async fn fetch_gv_spec_json(
-    client: &Client,
-    resolved: &ResolvedResource,
-) -> Result<Value> {
+async fn fetch_gv_spec_json(client: &Client, resolved: &ResolvedResource) -> Result<Value> {
     let discovery: Value = client
         .request(
             http::Request::builder()
@@ -125,10 +116,7 @@ async fn fetch_gv_spec_json(
     Ok(spec)
 }
 
-async fn fetch_schema_v3(
-    client: &Client,
-    resolved: &ResolvedResource,
-) -> Result<ResourceSchema> {
+async fn fetch_schema_v3(client: &Client, resolved: &ResolvedResource) -> Result<ResourceSchema> {
     let spec_json = fetch_gv_spec_json(client, resolved).await?;
 
     // Deserialize into typed OpenAPI
@@ -139,17 +127,22 @@ async fn fetch_schema_v3(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("No components in spec"))?;
 
-    let key =
-        find_definition_key(&components.schemas.keys().cloned().collect::<Vec<_>>(), resolved)?;
+    let key = find_definition_key(
+        &components.schemas.keys().cloned().collect::<Vec<_>>(),
+        resolved,
+    )?;
 
     let ctx = Ctx {
         schemas: &components.schemas,
     };
 
     let schema = ctx
-        .resolve_ref_or(components.schemas.get(&key).ok_or_else(|| {
-            anyhow::anyhow!("Definition not found: {}", key)
-        })?)
+        .resolve_ref_or(
+            components
+                .schemas
+                .get(&key)
+                .ok_or_else(|| anyhow::anyhow!("Definition not found: {}", key))?,
+        )
         .ok_or_else(|| anyhow::anyhow!("Could not resolve definition: {}", key))?;
 
     Ok(ctx.resource_schema(schema))
@@ -419,11 +412,7 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    fn variants(
-        &self,
-        kind: &'a oa::SchemaKind,
-        depth: usize,
-    ) -> Option<Vec<FieldSchema>> {
+    fn variants(&self, kind: &'a oa::SchemaKind, depth: usize) -> Option<Vec<FieldSchema>> {
         if depth > 10 {
             return None;
         }
@@ -463,7 +452,7 @@ fn oa_enum_values(kind: &oa::SchemaKind) -> Option<Vec<Value>> {
             if vals.is_empty() { None } else { Some(vals) }
         }
         oa::SchemaKind::Any(any) if !any.enumeration.is_empty() => {
-            let vals: Vec<Value> = any.enumeration.iter().filter_map(|v| Some(v.clone())).collect();
+            let vals: Vec<Value> = any.enumeration.to_vec();
             if vals.is_empty() { None } else { Some(vals) }
         }
         _ => None,
@@ -510,10 +499,7 @@ fn any_field(name: &str) -> FieldSchema {
 // V2 fallback: raw JSON with manual $ref resolution
 // ---------------------------------------------------------------------------
 
-async fn fetch_schema_v2(
-    client: &Client,
-    resolved: &ResolvedResource,
-) -> Result<ResourceSchema> {
+async fn fetch_schema_v2(client: &Client, resolved: &ResolvedResource) -> Result<ResourceSchema> {
     let openapi: Value = client
         .request(
             http::Request::builder()
@@ -547,12 +533,11 @@ struct V2Resolver<'a> {
 
 impl<'a> V2Resolver<'a> {
     fn resolve(&self, schema: &'a Value) -> &'a Value {
-        if let Some(ref_str) = schema.get("$ref").and_then(|v| v.as_str()) {
-            if let Some(path) = ref_str.strip_prefix("#/definitions/") {
-                if let Some(resolved) = self.root.get("definitions").and_then(|d| d.get(path)) {
-                    return resolved;
-                }
-            }
+        if let Some(ref_str) = schema.get("$ref").and_then(|v| v.as_str())
+            && let Some(path) = ref_str.strip_prefix("#/definitions/")
+            && let Some(resolved) = self.root.get("definitions").and_then(|d| d.get(path))
+        {
+            return resolved;
         }
         schema
     }
@@ -595,12 +580,7 @@ fn v2_parse_resource(definition: &Value, resolver: &V2Resolver) -> Result<Resour
     })
 }
 
-fn v2_parse_field(
-    name: &str,
-    schema: &Value,
-    resolver: &V2Resolver,
-    depth: usize,
-) -> FieldSchema {
+fn v2_parse_field(name: &str, schema: &Value, resolver: &V2Resolver, depth: usize) -> FieldSchema {
     if depth > 10 {
         return any_field(name);
     }
@@ -636,10 +616,7 @@ fn v2_parse_type(schema: &Value, resolver: &V2Resolver, depth: usize) -> FieldTy
         return FieldType::Any;
     }
 
-    let type_str = schema
-        .get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let type_str = schema.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     match type_str {
         "string" => FieldType::String,
