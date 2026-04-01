@@ -246,9 +246,9 @@ fn write_array_item(
                 if i == 0 {
                     // First field gets the "- " prefix
                     out.array_item_key(&sub.name, sub.description.as_deref(), indent);
-                    write_field_value_inline(out, sub, indent + 1, include_optional, minimal);
+                    write_field_value_inline(out, sub, indent, include_optional, minimal);
                 } else {
-                    write_field(out, sub, indent + 1, include_optional, minimal, None);
+                    write_field(out, sub, indent, include_optional, minimal, None);
                 }
             }
         }
