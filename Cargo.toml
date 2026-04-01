@@ -1,0 +1,31 @@
+[package]
+name = "kubectl-ditto"
+version = "0.1.0"
+edition = "2024"
+description = "kubectl plugin to generate YAML for any resource/CRD using cluster schema and smart defaults"
+license = "Apache-2.0"
+repository = "https://github.com/rawkode/kubectl-ditto"
+homepage = "https://github.com/rawkode/kubectl-ditto"
+
+[[bin]]
+name = "kubectl-ditto"
+path = "src/main.rs"
+
+[dependencies]
+argh = "0.1"
+kube = { version = "0.98", features = ["client", "runtime", "derive"] }
+k8s-openapi = { version = "0.24", features = ["latest"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+http = "1"
+dialoguer = "0.11"
+console = "0.15"
+openapiv3 = "2.2.0"
+indexmap = "2.13.0"
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
