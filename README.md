@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="logo.png" alt="kubectl-ditto logo" width="256" />
+</p>
+
 # kubectl-ditto
 
 A kubectl plugin that generates YAML for **any** Kubernetes resource or CRD using the cluster's OpenAPI schema and smart defaults.
