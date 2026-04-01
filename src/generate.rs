@@ -352,11 +352,7 @@ fn inline_comment(desc: Option<&str>, comments: bool) -> String {
 
 /// Select which sub-fields to show.  When nothing matches the filter we fall
 /// back to showing ALL sub-fields so we never discard known schema structure.
-fn filter_fields<'a>(
-    sub_fields: &'a [FieldSchema],
-    minimal: bool,
-    full: bool,
-) -> Vec<&'a FieldSchema> {
+fn filter_fields(sub_fields: &[FieldSchema], minimal: bool, full: bool) -> Vec<&FieldSchema> {
     let filtered: Vec<&FieldSchema> = sub_fields
         .iter()
         .filter(|f| {

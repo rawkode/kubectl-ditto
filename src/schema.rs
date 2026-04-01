@@ -253,10 +253,7 @@ impl<'a> Ctx<'a> {
     }
 
     /// Collect object properties from a SchemaKind, flattening allOf and resolving $ref.
-    fn collect_object_fields(
-        &self,
-        kind: &'a oa::SchemaKind,
-    ) -> (Vec<FieldSchema>, Vec<String>) {
+    fn collect_object_fields(&self, kind: &'a oa::SchemaKind) -> (Vec<FieldSchema>, Vec<String>) {
         match kind {
             oa::SchemaKind::Type(oa::Type::Object(obj)) => {
                 let fields = obj
@@ -281,8 +278,7 @@ impl<'a> Ctx<'a> {
                             Some(g) => g,
                             None => continue, // cycle — skip this allOf branch
                         };
-                        let (sub_fields, sub_req) =
-                            self.collect_object_fields(&schema.schema_kind);
+                        let (sub_fields, sub_req) = self.collect_object_fields(&schema.schema_kind);
                         fields.extend(sub_fields);
                         required.extend(sub_req);
                     }

@@ -23,7 +23,7 @@ pub struct ResolvedApiResource {
 #[derive(Debug, Clone, Deserialize)]
 struct ApiResourceEntry {
     name: String,
-    #[serde(rename = "singularName")]
+    #[serde(rename = "singularName", default)]
     singular_name: String,
     #[serde(default)]
     namespaced: bool,
@@ -45,8 +45,7 @@ struct ApiGroupList {
 #[derive(Debug, Deserialize)]
 struct ApiGroupEntry {
     name: String,
-    #[serde(rename = "preferredVersion")]
-    preferred_version: ApiGroupVersion,
+    versions: Vec<ApiGroupVersion>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,11 +134,44 @@ pub async fn resolve_resource(client: &Client, input: &str) -> Result<ResolvedRe
         }
     }
 
-    bail!(
-        "Could not find resource '{}' in the cluster. \
-         Make sure the CRD is installed and you have access.",
-        input
-    );
+    // Collect near-matches to help debug lookup failures
+    let mut suggestions: Vec<String> = Vec::new();
+    for res in &all_resources {
+        if res.entry.name.contains('/') {
+            continue;
+        }
+        let names: Vec<&str> = std::iter::once(res.entry.name.as_str())
+            .chain(std::iter::once(res.entry.kind.as_str()))
+            .chain(std::iter::once(res.entry.singular_name.as_str()))
+            .chain(res.entry.short_names.iter().map(|s| s.as_str()))
+            .collect();
+        if names.iter().any(|n| {
+            n.to_lowercase().contains(&input_lower) || input_lower.contains(&n.to_lowercase())
+        }) {
+            suggestions.push(format!(
+                "  {} (kind: {}, shortNames: [{}])",
+                res.entry.name,
+                res.entry.kind,
+                res.entry.short_names.join(", ")
+            ));
+        }
+    }
+
+    if suggestions.is_empty() {
+        bail!(
+            "Could not find resource '{}' in the cluster ({} resources discovered). \
+             Make sure the CRD is installed and you have access.",
+            input,
+            all_resources.len()
+        );
+    } else {
+        bail!(
+            "Could not find resource '{}' in the cluster, but found similar resources:\n{}\n\
+             Use the full resource name or a listed shortName.",
+            input,
+            suggestions.join("\n")
+        );
+    }
 }
 
 /// Query all API groups and their resources from the API server.
@@ -174,25 +206,40 @@ async fn discover_all_resources(client: &Client) -> Result<Vec<DiscoveredResourc
         .await?;
 
     for group in &groups.groups {
-        // Use preferred version
-        let gv = &group.preferred_version.group_version;
-        let uri = format!("/apis/{}", gv);
+        // Query all served versions — some resources only exist in non-preferred versions
+        // (e.g. kyverno.io/v1 has "policies" but kyverno.io/v2 does not)
+        let mut seen_resources = std::collections::HashSet::new();
 
-        let resource_list: Result<ApiResourceList, _> = client
-            .request(
-                http::Request::builder()
-                    .uri(&uri)
-                    .body(Default::default())?,
-            )
-            .await;
+        for gv_info in &group.versions {
+            let uri = format!("/apis/{}", gv_info.group_version);
 
-        if let Ok(resource_list) = resource_list {
-            for entry in resource_list.resources {
-                all.push(DiscoveredResource {
-                    entry,
-                    group: group.name.clone(),
-                    version: group.preferred_version.version.clone(),
-                });
+            let resource_list: Result<ApiResourceList, _> = client
+                .request(
+                    http::Request::builder()
+                        .uri(&uri)
+                        .body(Default::default())?,
+                )
+                .await;
+
+            match resource_list {
+                Ok(resource_list) => {
+                    for entry in resource_list.resources {
+                        // Deduplicate: only keep the first version of each resource
+                        if seen_resources.insert(entry.name.clone()) {
+                            all.push(DiscoveredResource {
+                                entry,
+                                group: group.name.clone(),
+                                version: gv_info.version.clone(),
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "Warning: failed to discover resources for {}: {}",
+                        gv_info.group_version, e
+                    );
+                }
             }
         }
     }
