@@ -90,14 +90,11 @@ jobs:
             --generate-notes \
             artifacts/*
 
-  update-krew:
+  krew:
     needs: release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Update krew manifest hashes
-        run: ./deploy/krew/update-sha256.sh ${{ github.ref_name }}
-
-      - name: Show updated manifest
-        run: cat deploy/krew/plugin.yaml
+      - name: Update krew-index
+        uses: rajatjindal/krew-release-bot@v0.0.51

@@ -18,8 +18,8 @@ pub struct Args {
     #[arg(long)]
     pub minimal: bool,
 
-    /// Include all optional fields with their defaults
-    #[arg(long)]
+    /// Include all optional fields (with defaults in output, or prompts with -i)
+    #[arg(long, alias = "all-fields")]
     pub full: bool,
 
     /// Interactively prompt for required field values

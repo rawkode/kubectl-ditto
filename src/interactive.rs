@@ -8,20 +8,31 @@ use serde_json::Value;
 use crate::schema::{FieldSchema, FieldType};
 
 /// Prompt the user interactively for values of the given fields.
+/// When `required_only` is true, the tree is walked depth-first but only
+/// required scalar fields are prompted — objects and arrays are always
+/// traversed so that deeply nested required fields are reached.
 /// Returns a map of field_name -> user-provided value.
-pub fn prompt_for_fields(fields: &[&FieldSchema]) -> Result<HashMap<String, Value>> {
+pub fn prompt_for_fields(
+    fields: &[&FieldSchema],
+    required_only: bool,
+) -> Result<HashMap<String, Value>> {
     let mut values = HashMap::new();
     let header = Style::new().bold().cyan();
     let dim = Style::new().dim();
 
+    let mode = if required_only {
+        "required fields only (use --full to prompt for all)"
+    } else {
+        "all fields (Enter to skip optional)"
+    };
     eprintln!(
         "{}",
-        header.apply_to("Interactive mode — fill in resource fields (Enter to skip optional)")
+        header.apply_to(format!("Interactive mode — {}", mode))
     );
     eprintln!();
 
     for field in fields {
-        if let Some(val) = prompt_field(field, &header, &dim, 0)? {
+        if let Some(val) = prompt_field(field, &header, &dim, 0, required_only)? {
             values.insert(field.name.clone(), val);
         }
     }
@@ -38,9 +49,24 @@ fn prompt_field(
     header: &Style,
     dim: &Style,
     depth: usize,
+    required_only: bool,
 ) -> Result<Option<Value>> {
     // Don't go too deep interactively
     if depth > 3 {
+        return Ok(None);
+    }
+
+    // For scalar types: skip non-required fields when required_only is set
+    let is_scalar = matches!(
+        &field.field_type,
+        FieldType::String
+            | FieldType::Integer
+            | FieldType::Number
+            | FieldType::Boolean
+            | FieldType::Map(_)
+            | FieldType::Any
+    );
+    if required_only && !field.required && is_scalar {
         return Ok(None);
     }
 
@@ -79,7 +105,7 @@ fn prompt_field(
                     Some(idx) => Ok(Some(Value::String(options[idx].clone()))),
                     None if field.required => {
                         eprintln!("  This field is required!");
-                        prompt_field(field, header, dim, depth)
+                        prompt_field(field, header, dim, depth, required_only)
                     }
                     None => Ok(None),
                 }
@@ -158,7 +184,7 @@ fn prompt_field(
 
             let mut map = serde_json::Map::new();
             for sub in sub_fields {
-                if let Some(val) = prompt_field(sub, header, dim, depth + 1)? {
+                if let Some(val) = prompt_field(sub, header, dim, depth + 1, required_only)? {
                     map.insert(sub.name.clone(), val);
                 }
             }
@@ -170,6 +196,18 @@ fn prompt_field(
             }
         }
         FieldType::Array(item_schema) if depth < 2 => {
+            // In required_only mode, skip non-required arrays that don't
+            // contain required fields (scalar item arrays)
+            if required_only && !field.required {
+                let has_required_children = match &item_schema.field_type {
+                    FieldType::Object(subs) => subs.iter().any(|s| s.required),
+                    _ => false,
+                };
+                if !has_required_children {
+                    return Ok(None);
+                }
+            }
+
             eprintln!(
                 "  {}",
                 header.apply_to(format!("── {} (array, Enter empty to stop) ──", field.name))
@@ -177,7 +215,7 @@ fn prompt_field(
 
             let mut items = Vec::new();
             loop {
-                let item = prompt_field(item_schema, header, dim, depth + 1)?;
+                let item = prompt_field(item_schema, header, dim, depth + 1, required_only)?;
                 match item {
                     Some(v) if v != Value::Null => items.push(v),
                     _ => break,

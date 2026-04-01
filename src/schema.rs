@@ -1,3 +1,6 @@
+use std::cell::RefCell;
+use std::collections::HashSet;
+
 use anyhow::{Result, bail};
 use kube::Client;
 use openapiv3 as oa;
@@ -134,6 +137,7 @@ async fn fetch_schema_v3(client: &Client, resolved: &ResolvedResource) -> Result
 
     let ctx = Ctx {
         schemas: &components.schemas,
+        expanding: RefCell::new(HashSet::new()),
     };
 
     let schema = ctx
@@ -149,14 +153,53 @@ async fn fetch_schema_v3(client: &Client, resolved: &ResolvedResource) -> Result
 }
 
 // ---------------------------------------------------------------------------
+// Cycle detection: track which schema addresses are currently being expanded
+// ---------------------------------------------------------------------------
+
+/// RAII guard that removes a schema address from the expanding set on drop.
+struct ExpandGuard<'a> {
+    set: &'a RefCell<HashSet<usize>>,
+    addr: usize,
+}
+
+impl Drop for ExpandGuard<'_> {
+    fn drop(&mut self) {
+        self.set.borrow_mut().remove(&self.addr);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Schema context: holds the schemas map for $ref resolution
 // ---------------------------------------------------------------------------
 
 struct Ctx<'a> {
     schemas: &'a indexmap::IndexMap<String, oa::ReferenceOr<oa::Schema>>,
+    /// Tracks pointer addresses of schemas currently being expanded on the
+    /// call stack.  If the same address is encountered again, it is a cycle
+    /// (e.g. JSONSchemaProps referencing itself) and we bail with `any_field`.
+    expanding: RefCell<HashSet<usize>>,
 }
 
 impl<'a> Ctx<'a> {
+    /// Try to enter expansion of the given schema.  Returns `Some(guard)` on
+    /// success — the guard removes the address on drop.  Returns `None` if the
+    /// schema is already being expanded (cycle).
+    fn enter(&self, schema: &oa::Schema) -> Option<ExpandGuard<'_>> {
+        let addr = schema as *const oa::Schema as usize;
+        if self.expanding.borrow_mut().insert(addr) {
+            Some(ExpandGuard {
+                set: &self.expanding,
+                addr,
+            })
+        } else {
+            None // cycle
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // $ref resolution (unchanged logic, no depth tracking)
+    // -----------------------------------------------------------------------
+
     /// Resolve a ReferenceOr<Schema> to &Schema.
     fn resolve_ref_or(&self, ref_or: &'a oa::ReferenceOr<oa::Schema>) -> Option<&'a oa::Schema> {
         match ref_or {
@@ -176,16 +219,7 @@ impl<'a> Ctx<'a> {
         &self,
         ref_or: &'a oa::ReferenceOr<oa::Schema>,
     ) -> Option<&'a oa::Schema> {
-        match ref_or {
-            oa::ReferenceOr::Item(s) => Some(s),
-            oa::ReferenceOr::Reference { reference } => {
-                let key = reference.strip_prefix("#/components/schemas/")?;
-                match self.schemas.get(key)? {
-                    oa::ReferenceOr::Item(s) => Some(s),
-                    _ => None,
-                }
-            }
-        }
+        self.resolve_ref_or(ref_or)
     }
 
     /// Resolve a ReferenceOr<Box<Schema>> to &Schema.
@@ -211,7 +245,7 @@ impl<'a> Ctx<'a> {
 
     fn resource_schema(&self, schema: &'a oa::Schema) -> ResourceSchema {
         let description = schema.schema_data.description.clone();
-        let (fields, _) = self.collect_object_fields(&schema.schema_kind, 0);
+        let (fields, _) = self.collect_object_fields(&schema.schema_kind);
         ResourceSchema {
             fields,
             description,
@@ -222,11 +256,7 @@ impl<'a> Ctx<'a> {
     fn collect_object_fields(
         &self,
         kind: &'a oa::SchemaKind,
-        depth: usize,
     ) -> (Vec<FieldSchema>, Vec<String>) {
-        if depth > 10 {
-            return (vec![], vec![]);
-        }
         match kind {
             oa::SchemaKind::Type(oa::Type::Object(obj)) => {
                 let fields = obj
@@ -234,7 +264,7 @@ impl<'a> Ctx<'a> {
                     .iter()
                     .filter_map(|(name, prop_ref)| {
                         let schema = self.resolve_boxed(prop_ref)?;
-                        let mut field = self.field(name, schema, depth + 1);
+                        let mut field = self.field(name, schema);
                         field.required = obj.required.contains(name);
                         Some(field)
                     })
@@ -246,8 +276,13 @@ impl<'a> Ctx<'a> {
                 let mut required = Vec::new();
                 for item in all_of {
                     if let Some(schema) = self.resolve_ref_or(item) {
+                        // Cycle detection for allOf items resolved via $ref
+                        let _guard = match self.enter(schema) {
+                            Some(g) => g,
+                            None => continue, // cycle — skip this allOf branch
+                        };
                         let (sub_fields, sub_req) =
-                            self.collect_object_fields(&schema.schema_kind, depth + 1);
+                            self.collect_object_fields(&schema.schema_kind);
                         fields.extend(sub_fields);
                         required.extend(sub_req);
                     }
@@ -265,7 +300,7 @@ impl<'a> Ctx<'a> {
                     .iter()
                     .filter_map(|(name, prop_ref)| {
                         let schema = self.resolve_boxed(prop_ref)?;
-                        let mut field = self.field(name, schema, depth + 1);
+                        let mut field = self.field(name, schema);
                         field.required = any.required.contains(name);
                         Some(field)
                     })
@@ -276,17 +311,20 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    fn field(&self, name: &str, schema: &'a oa::Schema, depth: usize) -> FieldSchema {
-        if depth > 10 {
-            return any_field(name);
-        }
+    fn field(&self, name: &str, schema: &'a oa::Schema) -> FieldSchema {
+        // Cycle detection: if this exact schema object is already being
+        // expanded on the current call stack, we have a circular reference.
+        let _guard = match self.enter(schema) {
+            Some(g) => g,
+            None => return any_field(name),
+        };
 
         let description = schema.schema_data.description.clone();
         let default = schema.schema_data.default.clone();
         let enum_values = oa_enum_values(&schema.schema_kind);
         let format = oa_format(&schema.schema_kind);
-        let variants = self.variants(&schema.schema_kind, depth);
-        let field_type = self.field_type(&schema.schema_kind, depth);
+        let variants = self.variants(&schema.schema_kind);
+        let field_type = self.field_type(&schema.schema_kind);
 
         FieldSchema {
             name: name.to_string(),
@@ -300,40 +338,37 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    fn field_type(&self, kind: &'a oa::SchemaKind, depth: usize) -> FieldType {
-        if depth > 10 {
-            return FieldType::Any;
-        }
+    fn field_type(&self, kind: &'a oa::SchemaKind) -> FieldType {
         match kind {
             oa::SchemaKind::Type(typ) => match typ {
                 oa::Type::String(_) => FieldType::String,
                 oa::Type::Integer(_) => FieldType::Integer,
                 oa::Type::Number(_) => FieldType::Number,
                 oa::Type::Boolean(_) => FieldType::Boolean,
-                oa::Type::Object(obj) => self.object_type(obj, depth),
-                oa::Type::Array(arr) => self.array_type(arr, depth),
+                oa::Type::Object(obj) => self.object_type(obj),
+                oa::Type::Array(arr) => self.array_type(arr),
             },
             oa::SchemaKind::AllOf { .. } => {
-                let (fields, _) = self.collect_object_fields(kind, depth);
+                let (fields, _) = self.collect_object_fields(kind);
                 if fields.is_empty() {
                     FieldType::Any
                 } else {
                     FieldType::Object(fields)
                 }
             }
-            oa::SchemaKind::Any(any) => self.any_type(any, depth),
+            oa::SchemaKind::Any(any) => self.any_type(any),
             _ => FieldType::Any,
         }
     }
 
-    fn object_type(&self, obj: &'a oa::ObjectType, depth: usize) -> FieldType {
+    fn object_type(&self, obj: &'a oa::ObjectType) -> FieldType {
         if !obj.properties.is_empty() {
             let fields = obj
                 .properties
                 .iter()
                 .filter_map(|(name, prop_ref)| {
                     let schema = self.resolve_boxed(prop_ref)?;
-                    let mut field = self.field(name, schema, depth + 1);
+                    let mut field = self.field(name, schema);
                     field.required = obj.required.contains(name);
                     Some(field)
                 })
@@ -343,7 +378,7 @@ impl<'a> Ctx<'a> {
             match additional {
                 oa::AdditionalProperties::Schema(s) => {
                     if let Some(schema) = self.resolve_ref_or_schema(s.as_ref()) {
-                        FieldType::Map(Some(Box::new(self.field("value", schema, depth + 1))))
+                        FieldType::Map(Some(Box::new(self.field("value", schema))))
                     } else {
                         FieldType::Map(None)
                     }
@@ -355,11 +390,11 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    fn array_type(&self, arr: &'a oa::ArrayType, depth: usize) -> FieldType {
+    fn array_type(&self, arr: &'a oa::ArrayType) -> FieldType {
         match &arr.items {
             Some(ref_or) => {
                 if let Some(schema) = self.resolve_boxed(ref_or) {
-                    FieldType::Array(Box::new(self.field("items", schema, depth + 1)))
+                    FieldType::Array(Box::new(self.field("items", schema)))
                 } else {
                     FieldType::Array(Box::new(any_field("items")))
                 }
@@ -368,13 +403,13 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    fn any_type(&self, any: &'a oa::AnySchema, depth: usize) -> FieldType {
+    fn any_type(&self, any: &'a oa::AnySchema) -> FieldType {
         // AnySchema with allOf — flatten
         if !any.all_of.is_empty() {
             let kind = oa::SchemaKind::AllOf {
                 all_of: any.all_of.clone(),
             };
-            return self.field_type(&kind, depth);
+            return self.field_type(&kind);
         }
 
         if !any.properties.is_empty() {
@@ -383,7 +418,7 @@ impl<'a> Ctx<'a> {
                 .iter()
                 .filter_map(|(name, prop_ref)| {
                     let schema = self.resolve_boxed(prop_ref)?;
-                    let mut field = self.field(name, schema, depth + 1);
+                    let mut field = self.field(name, schema);
                     field.required = any.required.contains(name);
                     Some(field)
                 })
@@ -398,7 +433,7 @@ impl<'a> Ctx<'a> {
                 "array" => match &any.items {
                     Some(ref_or) => {
                         if let Some(schema) = self.resolve_boxed(ref_or) {
-                            FieldType::Array(Box::new(self.field("items", schema, depth + 1)))
+                            FieldType::Array(Box::new(self.field("items", schema)))
                         } else {
                             FieldType::Array(Box::new(any_field("items")))
                         }
@@ -412,10 +447,7 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    fn variants(&self, kind: &'a oa::SchemaKind, depth: usize) -> Option<Vec<FieldSchema>> {
-        if depth > 10 {
-            return None;
-        }
+    fn variants(&self, kind: &'a oa::SchemaKind) -> Option<Vec<FieldSchema>> {
         let items = match kind {
             oa::SchemaKind::OneOf { one_of } => one_of,
             oa::SchemaKind::AnyOf { any_of } => any_of,
@@ -426,7 +458,7 @@ impl<'a> Ctx<'a> {
             .enumerate()
             .filter_map(|(i, item)| {
                 let schema = self.resolve_ref_or(item)?;
-                Some(self.field(&format!("variant_{}", i), schema, depth + 1))
+                Some(self.field(&format!("variant_{}", i), schema))
             })
             .collect();
         if parsed.is_empty() {
@@ -523,12 +555,17 @@ async fn fetch_schema_v2(client: &Client, resolved: &ResolvedResource) -> Result
         .get(&key)
         .ok_or_else(|| anyhow::anyhow!("Definition not found: {}", key))?;
 
-    let resolver = V2Resolver { root: &openapi };
+    let resolver = V2Resolver {
+        root: &openapi,
+        expanding: RefCell::new(HashSet::new()),
+    };
     v2_parse_resource(definition, &resolver)
 }
 
 struct V2Resolver<'a> {
     root: &'a Value,
+    /// Tracks pointer addresses of Value nodes currently being expanded.
+    expanding: RefCell<HashSet<usize>>,
 }
 
 impl<'a> V2Resolver<'a> {
@@ -540,6 +577,18 @@ impl<'a> V2Resolver<'a> {
             return resolved;
         }
         schema
+    }
+
+    /// Try to enter expansion of a resolved schema.  Returns true if this is
+    /// a new expansion; false if the schema is already on the call stack (cycle).
+    fn enter(&self, schema: &Value) -> bool {
+        let addr = schema as *const Value as usize;
+        self.expanding.borrow_mut().insert(addr)
+    }
+
+    fn leave(&self, schema: &Value) {
+        let addr = schema as *const Value as usize;
+        self.expanding.borrow_mut().remove(&addr);
     }
 }
 
@@ -569,7 +618,7 @@ fn v2_parse_resource(definition: &Value, resolver: &V2Resolver) -> Result<Resour
 
     let mut fields = Vec::new();
     for (name, prop_schema) in &properties {
-        let mut field = v2_parse_field(name, prop_schema, resolver, 0);
+        let mut field = v2_parse_field(name, prop_schema, resolver);
         field.required = required_names.contains(name);
         fields.push(field);
     }
@@ -580,11 +629,13 @@ fn v2_parse_resource(definition: &Value, resolver: &V2Resolver) -> Result<Resour
     })
 }
 
-fn v2_parse_field(name: &str, schema: &Value, resolver: &V2Resolver, depth: usize) -> FieldSchema {
-    if depth > 10 {
+fn v2_parse_field(name: &str, schema: &Value, resolver: &V2Resolver) -> FieldSchema {
+    let schema = resolver.resolve(schema);
+
+    // Cycle detection
+    if !resolver.enter(schema) {
         return any_field(name);
     }
-    let schema = resolver.resolve(schema);
 
     let description = schema
         .get("description")
@@ -597,7 +648,9 @@ fn v2_parse_field(name: &str, schema: &Value, resolver: &V2Resolver, depth: usiz
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let field_type = v2_parse_type(schema, resolver, depth);
+    let field_type = v2_parse_type(schema, resolver);
+
+    resolver.leave(schema);
 
     FieldSchema {
         name: name.to_string(),
@@ -611,11 +664,7 @@ fn v2_parse_field(name: &str, schema: &Value, resolver: &V2Resolver, depth: usiz
     }
 }
 
-fn v2_parse_type(schema: &Value, resolver: &V2Resolver, depth: usize) -> FieldType {
-    if depth > 10 {
-        return FieldType::Any;
-    }
-
+fn v2_parse_type(schema: &Value, resolver: &V2Resolver) -> FieldType {
     let type_str = schema.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
     match type_str {
@@ -625,7 +674,7 @@ fn v2_parse_type(schema: &Value, resolver: &V2Resolver, depth: usize) -> FieldTy
         "boolean" => FieldType::Boolean,
         "array" => {
             if let Some(items) = schema.get("items") {
-                let item = v2_parse_field("items", items, resolver, depth + 1);
+                let item = v2_parse_field("items", items, resolver);
                 FieldType::Array(Box::new(item))
             } else {
                 FieldType::Array(Box::new(any_field("items")))
@@ -646,14 +695,14 @@ fn v2_parse_type(schema: &Value, resolver: &V2Resolver, depth: usize) -> FieldTy
                 let fields = props
                     .iter()
                     .map(|(name, prop_schema)| {
-                        let mut f = v2_parse_field(name, prop_schema, resolver, depth + 1);
+                        let mut f = v2_parse_field(name, prop_schema, resolver);
                         f.required = required_names.contains(name);
                         f
                     })
                     .collect();
                 FieldType::Object(fields)
             } else if let Some(additional) = schema.get("additionalProperties") {
-                let value_schema = v2_parse_field("value", additional, resolver, depth + 1);
+                let value_schema = v2_parse_field("value", additional, resolver);
                 FieldType::Map(Some(Box::new(value_schema)))
             } else {
                 FieldType::Map(None)

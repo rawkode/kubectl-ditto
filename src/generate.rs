@@ -6,6 +6,28 @@ use crate::discovery::ResolvedResource;
 use crate::interactive;
 use crate::schema::{FieldSchema, FieldType, ResourceSchema};
 
+// ---------------------------------------------------------------------------
+// YAML scaffold tree
+// ---------------------------------------------------------------------------
+
+/// A node in the YAML scaffold tree.  Built from the schema, then emitted as
+/// YAML text in a second pass.  Separating construction from emission keeps
+/// both halves simple and makes indentation/array-item formatting automatic.
+enum YamlNode {
+    /// A scalar value, already formatted for YAML (e.g. `"\"hello\""`, `"0"`).
+    Scalar(String),
+    /// An ordered mapping: `(key, value, optional_description)`.
+    Object(Vec<(String, YamlNode, Option<String>)>),
+    /// A sequence with one example item.
+    Array(Vec<YamlNode>),
+    /// A free-form map — rendered as a `# key: value` placeholder comment.
+    Map,
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
 /// Generate YAML for the resource using its schema and smart defaults.
 pub fn generate_yaml(
     resolved: &ResolvedResource,
@@ -13,13 +35,12 @@ pub fn generate_yaml(
     args: &Args,
 ) -> Result<String> {
     let name = args.name.as_deref().unwrap_or("my-resource");
-    let include_comments = !args.no_comments;
-    let include_optional = args.full;
+    let comments = !args.no_comments;
+    let full = args.full;
     let minimal = args.minimal;
 
-    let mut out = YamlWriter::new(include_comments);
-
-    out.line("---");
+    // --- Build document tree ------------------------------------------------
+    let mut entries: Vec<(String, YamlNode, Option<String>)> = Vec::new();
 
     // apiVersion
     let api_version = if resolved.group.is_empty() {
@@ -27,23 +48,27 @@ pub fn generate_yaml(
     } else {
         format!("{}/{}", resolved.group, resolved.version)
     };
-    out.field("apiVersion", &api_version, None, 0);
+    entries.push(("apiVersion".into(), YamlNode::Scalar(api_version), None));
 
     // kind
-    out.field("kind", &resolved.api_resource.kind, None, 0);
+    entries.push((
+        "kind".into(),
+        YamlNode::Scalar(resolved.api_resource.kind.clone()),
+        None,
+    ));
 
     // metadata
-    out.key("metadata", None, 0);
-    out.field("name", name, None, 1);
+    let mut meta = vec![("name".into(), YamlNode::Scalar(name.into()), None)];
     if let Some(ref ns) = args.namespace {
         if resolved.namespaced {
-            out.field("namespace", ns, None, 1);
+            meta.push(("namespace".into(), YamlNode::Scalar(ns.clone()), None));
         }
     } else if resolved.namespaced {
-        out.field("namespace", "default", None, 1);
+        meta.push(("namespace".into(), YamlNode::Scalar("default".into()), None));
     }
+    entries.push(("metadata".into(), YamlNode::Object(meta), None));
 
-    // Collect fields to render (skip apiVersion, kind, metadata, status)
+    // Spec-level fields (skip apiVersion, kind, metadata, status)
     let fields_to_render: Vec<&FieldSchema> = schema
         .fields
         .iter()
@@ -56,257 +81,298 @@ pub fn generate_yaml(
         .filter(|f| if minimal { f.required } else { true })
         .collect();
 
-    // If interactive, prompt for values
+    // Interactive values: -i alone prompts required only, -i --full prompts all
     let interactive_values = if args.interactive {
-        Some(interactive::prompt_for_fields(&fields_to_render)?)
+        Some(interactive::prompt_for_fields(&fields_to_render, !full)?)
     } else {
         None
     };
 
     for field in &fields_to_render {
-        let interactive_val = interactive_values
+        let iv = interactive_values.as_ref().and_then(|m| m.get(&field.name));
+        let node = build_node(field, full, minimal, iv);
+        let desc = field
+            .description
             .as_ref()
-            .and_then(|iv| iv.get(&field.name));
-
-        write_field(
-            &mut out,
-            field,
-            0,
-            include_optional,
-            minimal,
-            interactive_val,
-        );
+            .map(|d| first_sentence(d).to_string());
+        entries.push((field.name.clone(), node, desc));
     }
 
-    Ok(out.finish())
+    // --- Emit YAML ----------------------------------------------------------
+    let yaml = emit_yaml(&YamlNode::Object(entries), comments);
+    Ok(format!("---\n{}", yaml))
 }
 
-fn write_field(
-    out: &mut YamlWriter,
+// ---------------------------------------------------------------------------
+// Tree builder: FieldSchema -> YamlNode
+// ---------------------------------------------------------------------------
+
+fn build_node(
     field: &FieldSchema,
-    indent: usize,
-    include_optional: bool,
+    full: bool,
     minimal: bool,
     interactive_val: Option<&Value>,
-) {
-    // If we have an interactive value, use it directly
+) -> YamlNode {
+    // Interactive value overrides everything
     if let Some(val) = interactive_val {
-        write_value_at_key(out, &field.name, val, field.description.as_deref(), indent);
-        return;
+        return value_to_node(val);
     }
 
-    // Check for default value — skip empty object/array defaults when the field
-    // has structured sub-fields (the sub-fields are more useful than "{}" or "[]")
+    // Schema default — skip empty {} / [] when we have structural sub-fields
     if let Some(ref default) = field.default {
-        let is_empty_default = matches!(
-            default,
-            Value::Object(m) if m.is_empty()
-        ) || matches!(
-            default,
-            Value::Array(a) if a.is_empty()
-        );
-        let has_sub_fields = matches!(&field.field_type, FieldType::Object(f) if !f.is_empty())
-            || matches!(&field.field_type, FieldType::Array(_));
-
-        if !is_empty_default || !has_sub_fields {
-            write_value_at_key(
-                out,
-                &field.name,
-                default,
-                field.description.as_deref(),
-                indent,
-            );
-            return;
+        let is_empty = matches!(default, Value::Object(m) if m.is_empty())
+            || matches!(default, Value::Array(a) if a.is_empty());
+        let is_structured = matches!(&field.field_type, FieldType::Object(f) if !f.is_empty())
+            || matches!(&field.field_type, FieldType::Array(_))
+            || matches!(&field.field_type, FieldType::Map(Some(_)));
+        if !is_empty || !is_structured {
+            return YamlNode::Scalar(format_value(default));
         }
     }
 
-    // Handle enum: use first value
+    // Enum: use first value
     if let Some(ref enum_vals) = field.enum_values
         && let Some(first) = enum_vals.first()
     {
-        let comment = field.description.as_ref().map(|d| {
-            let options: Vec<String> = enum_vals
-                .iter()
-                .filter_map(|v| v.as_str().map(|s| s.to_string()))
-                .collect();
-            format!("{} (options: {})", d, options.join(", "))
-        });
-        write_value_at_key(
-            out,
-            &field.name,
-            first,
-            comment.as_deref().or(field.description.as_deref()),
-            indent,
-        );
-        return;
+        return YamlNode::Scalar(format_value(first));
     }
 
+    // Type-based scaffold
     match &field.field_type {
         FieldType::String => {
-            let placeholder = if let Some(ref fmt) = field.format {
-                match fmt.as_str() {
-                    "date-time" => "\"2025-01-01T00:00:00Z\"",
-                    "byte" => "\"\"",
-                    _ => "\"\"",
-                }
-            } else {
-                "\"\""
+            let s = match field.format.as_deref() {
+                Some("date-time") => "\"2025-01-01T00:00:00Z\"",
+                _ => "\"\"",
             };
-            out.field_raw(
-                &field.name,
-                placeholder,
-                field.description.as_deref(),
-                indent,
-            );
+            YamlNode::Scalar(s.into())
         }
-        FieldType::Integer => {
-            out.field_raw(&field.name, "0", field.description.as_deref(), indent);
-        }
-        FieldType::Number => {
-            out.field_raw(&field.name, "0.0", field.description.as_deref(), indent);
-        }
-        FieldType::Boolean => {
-            out.field_raw(&field.name, "false", field.description.as_deref(), indent);
-        }
+        FieldType::Integer => YamlNode::Scalar("0".into()),
+        FieldType::Number => YamlNode::Scalar("0.0".into()),
+        FieldType::Boolean => YamlNode::Scalar("false".into()),
         FieldType::Array(item_schema) => {
-            out.key(&field.name, field.description.as_deref(), indent);
-            write_array_item(out, item_schema, indent + 1, include_optional, minimal);
+            let item = build_node(item_schema, full, minimal, None);
+            YamlNode::Array(vec![item])
         }
         FieldType::Object(sub_fields) => {
             if sub_fields.is_empty() {
-                out.field_raw(&field.name, "{}", field.description.as_deref(), indent);
-                return;
+                return YamlNode::Scalar("{}".into());
             }
-
-            out.key(&field.name, field.description.as_deref(), indent);
-
-            let fields_to_show: Vec<&FieldSchema> = sub_fields
-                .iter()
-                .filter(|f| {
-                    if minimal {
-                        f.required
-                    } else if include_optional {
-                        true
-                    } else {
-                        f.required || is_commonly_needed(f)
-                    }
-                })
-                .collect();
-
-            if fields_to_show.is_empty() {
-                // Show at least one field or empty object
-                if let Some(first) = sub_fields.first() {
-                    write_field(out, first, indent + 1, include_optional, minimal, None);
-                }
-            } else {
-                for sub in fields_to_show {
-                    write_field(out, sub, indent + 1, include_optional, minimal, None);
-                }
-            }
+            build_object_node(sub_fields, full, minimal)
         }
-        FieldType::Map(_value_schema) => {
-            out.key(&field.name, field.description.as_deref(), indent);
-            out.comment("key: value", indent + 1);
-        }
-        FieldType::Any => {
-            out.field_raw(&field.name, "null", field.description.as_deref(), indent);
-        }
+        FieldType::Map(_) => YamlNode::Map,
+        FieldType::Any => YamlNode::Scalar("null".into()),
     }
 }
 
-fn write_array_item(
-    out: &mut YamlWriter,
-    item: &FieldSchema,
-    indent: usize,
-    include_optional: bool,
-    minimal: bool,
-) {
-    match &item.field_type {
-        FieldType::Object(sub_fields) => {
-            let fields_to_show: Vec<&FieldSchema> = sub_fields
-                .iter()
-                .filter(|f| {
-                    if minimal {
-                        f.required
-                    } else if include_optional {
-                        true
-                    } else {
-                        f.required || is_commonly_needed(f)
-                    }
-                })
-                .collect();
-
-            let fields = if fields_to_show.is_empty() {
-                sub_fields.iter().take(1).collect::<Vec<_>>()
-            } else {
-                fields_to_show
-            };
-
-            for (i, sub) in fields.iter().enumerate() {
-                if i == 0 {
-                    // First field gets the "- " prefix
-                    out.array_item_key(&sub.name, sub.description.as_deref(), indent);
-                    write_field_value_inline(out, sub, indent, include_optional, minimal);
-                } else {
-                    write_field(out, sub, indent, include_optional, minimal, None);
-                }
-            }
-        }
-        FieldType::String => {
-            out.array_item_value("\"\"", indent);
-        }
-        FieldType::Integer => {
-            out.array_item_value("0", indent);
-        }
-        _ => {
-            out.array_item_value("{}", indent);
-        }
-    }
+/// Build an Object node from a list of sub-fields, applying the
+/// minimal / full / commonly-needed filter.
+fn build_object_node(sub_fields: &[FieldSchema], full: bool, minimal: bool) -> YamlNode {
+    let shown = filter_fields(sub_fields, minimal, full);
+    let entries = shown
+        .into_iter()
+        .map(|f| {
+            let node = build_node(f, full, minimal, None);
+            let desc = f
+                .description
+                .as_ref()
+                .map(|d| first_sentence(d).to_string());
+            (f.name.clone(), node, desc)
+        })
+        .collect();
+    YamlNode::Object(entries)
 }
 
-/// Write the value part of a field that was started as an array item key.
-fn write_field_value_inline(
-    out: &mut YamlWriter,
-    field: &FieldSchema,
-    _indent: usize,
-    _include_optional: bool,
-    _minimal: bool,
-) {
-    if let Some(ref default) = field.default {
-        out.append_value(&format_value(default));
-        return;
-    }
-
-    match &field.field_type {
-        FieldType::String => out.append_value("\"\""),
-        FieldType::Integer => out.append_value("0"),
-        FieldType::Number => out.append_value("0.0"),
-        FieldType::Boolean => out.append_value("false"),
-        _ => out.append_value("{}"),
-    }
-}
-
-fn write_value_at_key(
-    out: &mut YamlWriter,
-    key: &str,
-    value: &Value,
-    description: Option<&str>,
-    indent: usize,
-) {
-    let formatted = format_value(value);
-    out.field_raw(key, &formatted, description, indent);
-}
-
-fn format_value(value: &Value) -> String {
+/// Convert a serde_json::Value (from interactive input) into a YamlNode.
+fn value_to_node(value: &Value) -> YamlNode {
     match value {
-        Value::String(s) => format!("\"{}\"", s.replace('"', "\\\"")),
-        Value::Number(n) => n.to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Null => "null".to_string(),
-        Value::Array(arr) if arr.is_empty() => "[]".to_string(),
-        Value::Object(map) if map.is_empty() => "{}".to_string(),
-        // For complex defaults, fall back to inline JSON-ish
-        _ => serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()),
+        Value::Object(map) => {
+            let entries = map
+                .iter()
+                .map(|(k, v)| (k.clone(), value_to_node(v), None))
+                .collect();
+            YamlNode::Object(entries)
+        }
+        Value::Array(arr) => YamlNode::Array(arr.iter().map(value_to_node).collect()),
+        other => YamlNode::Scalar(format_value(other)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// YAML emitter: YamlNode -> String
+// ---------------------------------------------------------------------------
+
+fn emit_yaml(node: &YamlNode, comments: bool) -> String {
+    let mut lines = Vec::new();
+    if let YamlNode::Object(entries) = node {
+        for (key, value, desc) in entries {
+            emit_entry(&mut lines, key, value, desc.as_deref(), 0, comments);
+        }
+    }
+    lines.join("\n")
+}
+
+/// Emit a single key-value entry at the given indentation level.
+fn emit_entry(
+    lines: &mut Vec<String>,
+    key: &str,
+    value: &YamlNode,
+    desc: Option<&str>,
+    indent: usize,
+    comments: bool,
+) {
+    let pfx = "  ".repeat(indent);
+    let cmt = inline_comment(desc, comments);
+
+    match value {
+        YamlNode::Scalar(s) => {
+            lines.push(format!("{}{}: {}{}", pfx, key, s, cmt));
+        }
+        YamlNode::Object(entries) if entries.is_empty() => {
+            lines.push(format!("{}{}: {{}}{}", pfx, key, cmt));
+        }
+        YamlNode::Object(entries) => {
+            lines.push(format!("{}{}:{}", pfx, key, cmt));
+            for (k, v, d) in entries {
+                emit_entry(lines, k, v, d.as_deref(), indent + 1, comments);
+            }
+        }
+        YamlNode::Array(items) if items.is_empty() => {
+            lines.push(format!("{}{}: []{}", pfx, key, cmt));
+        }
+        YamlNode::Array(items) => {
+            lines.push(format!("{}{}:{}", pfx, key, cmt));
+            for item in items {
+                emit_array_item(lines, item, indent + 1, comments);
+            }
+        }
+        YamlNode::Map => {
+            lines.push(format!("{}{}:{}", pfx, key, cmt));
+            let inner = "  ".repeat(indent + 1);
+            lines.push(format!("{}# key: value", inner));
+        }
+    }
+}
+
+/// Emit an array item (the `- …` line(s)).
+fn emit_array_item(lines: &mut Vec<String>, item: &YamlNode, indent: usize, comments: bool) {
+    let pfx = "  ".repeat(indent.saturating_sub(1));
+
+    match item {
+        YamlNode::Scalar(s) => {
+            lines.push(format!("{}- {}", pfx, s));
+        }
+        YamlNode::Object(entries) if entries.is_empty() => {
+            lines.push(format!("{}- {{}}", pfx));
+        }
+        YamlNode::Object(entries) => {
+            // Reorder: scalar fields first for clean `- key: value` syntax,
+            // then complex fields (objects, arrays, maps) below.
+            let (scalars, complex): (Vec<_>, Vec<_>) = entries
+                .iter()
+                .partition(|(_, v, _)| matches!(v, YamlNode::Scalar(_)));
+            let ordered: Vec<_> = scalars.into_iter().chain(complex).collect();
+
+            for (i, (key, value, desc)) in ordered.iter().enumerate() {
+                let cmt = inline_comment(desc.as_deref(), comments);
+
+                if i == 0 {
+                    emit_first_array_field(lines, key, value, &cmt, indent, comments);
+                } else {
+                    emit_entry(lines, key, value, desc.as_deref(), indent, comments);
+                }
+            }
+        }
+        YamlNode::Array(items) => {
+            // Array of arrays — unusual but handle it
+            for sub in items {
+                emit_array_item(lines, sub, indent, comments);
+            }
+        }
+        YamlNode::Map => {
+            lines.push(format!("{}- {{}}", pfx));
+        }
+    }
+}
+
+/// Emit the first field of an object that lives inside an array.
+/// Scalar fields get the compact `- key: value` form.
+/// Complex fields get `- key:\n  <sub-structure>`.
+fn emit_first_array_field(
+    lines: &mut Vec<String>,
+    key: &str,
+    value: &YamlNode,
+    cmt: &str,
+    indent: usize,
+    comments: bool,
+) {
+    let pfx = "  ".repeat(indent.saturating_sub(1));
+
+    match value {
+        YamlNode::Scalar(s) => {
+            lines.push(format!("{}- {}: {}{}", pfx, key, s, cmt));
+        }
+        YamlNode::Object(sub) if sub.is_empty() => {
+            lines.push(format!("{}- {}: {{}}{}", pfx, key, cmt));
+        }
+        YamlNode::Object(sub) => {
+            lines.push(format!("{}- {}:{}", pfx, key, cmt));
+            for (sk, sv, sd) in sub {
+                emit_entry(lines, sk, sv, sd.as_deref(), indent + 1, comments);
+            }
+        }
+        YamlNode::Array(sub) if sub.is_empty() => {
+            lines.push(format!("{}- {}: []{}", pfx, key, cmt));
+        }
+        YamlNode::Array(sub) => {
+            lines.push(format!("{}- {}:{}", pfx, key, cmt));
+            for sub_item in sub {
+                emit_array_item(lines, sub_item, indent + 1, comments);
+            }
+        }
+        YamlNode::Map => {
+            lines.push(format!("{}- {}:{}", pfx, key, cmt));
+            let inner = "  ".repeat(indent + 1);
+            lines.push(format!("{}# key: value", inner));
+        }
+    }
+}
+
+/// Format an optional description as an inline YAML comment.
+fn inline_comment(desc: Option<&str>, comments: bool) -> String {
+    if comments {
+        desc.map(|d| format!("  # {}", d)).unwrap_or_default()
+    } else {
+        String::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Field filtering
+// ---------------------------------------------------------------------------
+
+/// Select which sub-fields to show.  When nothing matches the filter we fall
+/// back to showing ALL sub-fields so we never discard known schema structure.
+fn filter_fields<'a>(
+    sub_fields: &'a [FieldSchema],
+    minimal: bool,
+    full: bool,
+) -> Vec<&'a FieldSchema> {
+    let filtered: Vec<&FieldSchema> = sub_fields
+        .iter()
+        .filter(|f| {
+            if minimal {
+                f.required
+            } else if full {
+                true
+            } else {
+                f.required || is_commonly_needed(f)
+            }
+        })
+        .collect();
+    if filtered.is_empty() {
+        sub_fields.iter().collect()
+    } else {
+        filtered
     }
 }
 
@@ -314,6 +380,7 @@ fn format_value(value: &Value) -> String {
 fn is_commonly_needed(field: &FieldSchema) -> bool {
     matches!(
         field.name.as_str(),
+        // Core identifiers & config
         "name"
             | "image"
             | "containerPort"
@@ -331,9 +398,26 @@ fn is_commonly_needed(field: &FieldSchema) -> bool {
             | "type"
             | "data"
             | "stringData"
+            // Env detail
+            | "value"
+            | "valueFrom"
+            // Resource limits
+            | "limits"
+            | "requests"
+            | "claims"
+            | "request"
+            // Container execution
+            | "command"
+            | "args"
+            // Volumes
+            | "volumeMounts"
+            | "mountPath"
+            | "volumes"
+            // RBAC
             | "rules"
             | "subjects"
             | "roleRef"
+            // Structural
             | "spec"
             // NetworkPolicy
             | "podSelector"
@@ -343,13 +427,17 @@ fn is_commonly_needed(field: &FieldSchema) -> bool {
             | "from"
             | "to"
             | "matchLabels"
+            | "matchExpressions"
             // Ingress
             | "ingressClassName"
             | "tls"
-            // PV/PVC
+            // PV / PVC
             | "accessModes"
             | "storageClassName"
-            // Jobs/CronJobs
+            // StatefulSet
+            | "serviceName"
+            | "volumeClaimTemplates"
+            // Jobs / CronJobs
             | "schedule"
             | "jobTemplate"
             // HPA
@@ -359,108 +447,25 @@ fn is_commonly_needed(field: &FieldSchema) -> bool {
     )
 }
 
-/// Custom YAML writer that supports inline comments.
-struct YamlWriter {
-    lines: Vec<String>,
-    include_comments: bool,
-}
+// ---------------------------------------------------------------------------
+// Formatting helpers
+// ---------------------------------------------------------------------------
 
-impl YamlWriter {
-    fn new(include_comments: bool) -> Self {
-        Self {
-            lines: Vec::new(),
-            include_comments,
-        }
-    }
-
-    /// Write a raw line.
-    fn line(&mut self, text: &str) {
-        self.lines.push(text.to_string());
-    }
-
-    /// Write a comment line.
-    fn comment(&mut self, text: &str, indent: usize) {
-        if self.include_comments {
-            let prefix = "  ".repeat(indent);
-            self.lines.push(format!("{}# {}", prefix, text));
-        }
-    }
-
-    /// Write a key-value field with an optional description comment.
-    fn field(&mut self, key: &str, value: &str, description: Option<&str>, indent: usize) {
-        let prefix = "  ".repeat(indent);
-        if let Some(desc) = description {
-            if self.include_comments {
-                // Truncate long descriptions to first sentence
-                let short = first_sentence(desc);
-                self.lines
-                    .push(format!("{}{}: {}  # {}", prefix, key, value, short));
-            } else {
-                self.lines.push(format!("{}{}: {}", prefix, key, value));
-            }
-        } else {
-            self.lines.push(format!("{}{}: {}", prefix, key, value));
-        }
-    }
-
-    /// Write a key-value field with a raw (unquoted) value.
-    fn field_raw(&mut self, key: &str, raw_value: &str, description: Option<&str>, indent: usize) {
-        self.field(key, raw_value, description, indent);
-    }
-
-    /// Write just a key (for nested objects).
-    fn key(&mut self, key: &str, description: Option<&str>, indent: usize) {
-        let prefix = "  ".repeat(indent);
-        if let Some(desc) = description {
-            if self.include_comments {
-                let short = first_sentence(desc);
-                self.lines.push(format!("{}{}:  # {}", prefix, key, short));
-            } else {
-                self.lines.push(format!("{}{}:", prefix, key));
-            }
-        } else {
-            self.lines.push(format!("{}{}:", prefix, key));
-        }
-    }
-
-    /// Write an array item that is a key (first field of an object in an array).
-    fn array_item_key(&mut self, key: &str, description: Option<&str>, indent: usize) {
-        let prefix = "  ".repeat(indent.saturating_sub(1));
-        if let Some(desc) = description {
-            if self.include_comments {
-                let short = first_sentence(desc);
-                self.lines.push(format!("{}- {}: ", prefix, key));
-                // Comment on previous line would be awkward, skip for array items
-                let _ = short;
-            } else {
-                self.lines.push(format!("{}- {}: ", prefix, key));
-            }
-        } else {
-            self.lines.push(format!("{}- {}: ", prefix, key));
-        }
-    }
-
-    /// Append a value to the last line (for array item inline values).
-    fn append_value(&mut self, value: &str) {
-        if let Some(last) = self.lines.last_mut() {
-            last.push_str(value);
-        }
-    }
-
-    /// Write a simple array item value.
-    fn array_item_value(&mut self, value: &str, indent: usize) {
-        let prefix = "  ".repeat(indent.saturating_sub(1));
-        self.lines.push(format!("{}- {}", prefix, value));
-    }
-
-    fn finish(self) -> String {
-        self.lines.join("\n")
+fn format_value(value: &Value) -> String {
+    match value {
+        Value::String(s) => format!("\"{}\"", s.replace('"', "\\\"")),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Null => "null".to_string(),
+        Value::Array(arr) if arr.is_empty() => "[]".to_string(),
+        Value::Object(map) if map.is_empty() => "{}".to_string(),
+        // For complex defaults, fall back to inline JSON-ish
+        _ => serde_json::to_string(value).unwrap_or_else(|_| "null".to_string()),
     }
 }
 
-/// Extract the first sentence from a description string.
+/// Extract the first sentence from a description string, capped at 120 chars.
 fn first_sentence(desc: &str) -> &str {
-    // Remove newlines, take first sentence
     let clean = desc.split('\n').next().unwrap_or(desc);
     let end = clean
         .find(". ")
@@ -469,7 +474,6 @@ fn first_sentence(desc: &str) -> &str {
         .unwrap_or(clean.len());
 
     let result = &clean[..end];
-    // Cap at reasonable length
     if result.len() > 120 {
         &result[..120]
     } else {
