@@ -575,16 +575,19 @@ impl<'a> V2Resolver<'a> {
         schema
     }
 
-    /// Try to enter expansion of a resolved schema.  Returns true if this is
-    /// a new expansion; false if the schema is already on the call stack (cycle).
-    fn enter(&self, schema: &Value) -> bool {
+    /// Try to enter expansion of a resolved schema. Returns `Some(guard)` if
+    /// this is a new expansion; `None` if the schema is already on the call
+    /// stack (cycle).
+    fn enter(&self, schema: &Value) -> Option<ExpandGuard<'_>> {
         let addr = schema as *const Value as usize;
-        self.expanding.borrow_mut().insert(addr)
-    }
-
-    fn leave(&self, schema: &Value) {
-        let addr = schema as *const Value as usize;
-        self.expanding.borrow_mut().remove(&addr);
+        if self.expanding.borrow_mut().insert(addr) {
+            Some(ExpandGuard {
+                set: &self.expanding,
+                addr,
+            })
+        } else {
+            None
+        }
     }
 }
 
@@ -629,9 +632,10 @@ fn v2_parse_field(name: &str, schema: &Value, resolver: &V2Resolver) -> FieldSch
     let schema = resolver.resolve(schema);
 
     // Cycle detection
-    if !resolver.enter(schema) {
-        return any_field(name);
-    }
+    let _guard = match resolver.enter(schema) {
+        Some(guard) => guard,
+        None => return any_field(name),
+    };
 
     let description = schema
         .get("description")
@@ -645,8 +649,6 @@ fn v2_parse_field(name: &str, schema: &Value, resolver: &V2Resolver) -> FieldSch
         .map(|s| s.to_string());
 
     let field_type = v2_parse_type(schema, resolver);
-
-    resolver.leave(schema);
 
     FieldSchema {
         name: name.to_string(),
@@ -758,4 +760,33 @@ fn find_definition_key(candidates: &[String], resolved: &ResolvedResource) -> Re
         version,
         kind
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn v2_enter_then_fail(resolver: &V2Resolver<'_>, schema: &Value) -> Result<(), ()> {
+        let _guard = resolver
+            .enter(schema)
+            .expect("schema should not already be expanding");
+        Err(())
+    }
+
+    #[test]
+    fn v2_expand_guard_cleans_up_after_early_return() {
+        let root = json!({});
+        let schema = json!({ "type": "object" });
+        let resolver = V2Resolver {
+            root: &root,
+            expanding: RefCell::new(HashSet::new()),
+        };
+
+        assert!(v2_enter_then_fail(&resolver, &schema).is_err());
+        assert!(
+            resolver.enter(&schema).is_some(),
+            "schema should be removable from the expanding set when the guard drops",
+        );
+    }
 }
