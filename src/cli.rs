@@ -52,7 +52,7 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn parses_kubeconfig_and_context_flags() {
+    fn test_parses_kubeconfig_and_context_flags() {
         let args = Args::parse_from([
             "kubectl-ditto",
             "--kubeconfig",
@@ -70,7 +70,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_context_without_custom_kubeconfig() {
+    fn test_parses_context_without_custom_kubeconfig() {
         let args = Args::parse_from(["kubectl-ditto", "--context", "staging", "deployment"]);
 
         assert_eq!(args.kubeconfig, None);
