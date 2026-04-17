@@ -1,4 +1,5 @@
 use anyhow::Result;
+use k8s_openapi::chrono::{SecondsFormat, Utc};
 use serde_json::Value;
 
 use crate::cli::Args;
@@ -141,10 +142,10 @@ fn build_node(
     match &field.field_type {
         FieldType::String => {
             let s = match field.format.as_deref() {
-                Some("date-time") => "\"2025-01-01T00:00:00Z\"",
-                _ => "\"\"",
+                Some("date-time") => current_datetime_placeholder(),
+                _ => "\"\"".to_string(),
             };
-            YamlNode::Scalar(s.into())
+            YamlNode::Scalar(s)
         }
         FieldType::Integer => YamlNode::Scalar("0".into()),
         FieldType::Number => YamlNode::Scalar("0.0".into()),
@@ -162,6 +163,13 @@ fn build_node(
         FieldType::Map(_) => YamlNode::Map,
         FieldType::Any => YamlNode::Scalar("null".into()),
     }
+}
+
+fn current_datetime_placeholder() -> String {
+    format!(
+        "\"{}\"",
+        Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+    )
 }
 
 /// Build an Object node from a list of sub-fields, applying the
@@ -474,5 +482,46 @@ fn first_sentence(desc: &str) -> &str {
         &result[..120]
     } else {
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use k8s_openapi::chrono::{Duration, Utc};
+
+    use super::{YamlNode, build_node};
+    use crate::schema::{FieldSchema, FieldType};
+
+    #[test]
+    fn date_time_placeholders_use_current_rfc3339_time() {
+        let field = FieldSchema {
+            name: "createdAt".into(),
+            description: None,
+            field_type: FieldType::String,
+            required: false,
+            default: None,
+            enum_values: None,
+            variants: None,
+            format: Some("date-time".into()),
+        };
+
+        let before = Utc::now();
+        let node = build_node(&field, false, false, None);
+        let after = Utc::now();
+
+        let YamlNode::Scalar(value) = node else {
+            panic!("expected scalar date-time placeholder");
+        };
+
+        let placeholder = value
+            .strip_prefix('"')
+            .and_then(|value| value.strip_suffix('"'))
+            .expect("date-time placeholder should be quoted");
+        let parsed = k8s_openapi::chrono::DateTime::parse_from_rfc3339(placeholder)
+            .expect("date-time placeholder should be valid RFC3339")
+            .with_timezone(&Utc);
+
+        assert!(parsed >= before - Duration::seconds(1));
+        assert!(parsed <= after + Duration::seconds(1));
     }
 }
