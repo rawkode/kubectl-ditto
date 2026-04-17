@@ -765,14 +765,13 @@ fn find_definition_key(candidates: &[String], resolved: &ResolvedResource) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use anyhow::{Result, bail};
     use serde_json::json;
 
-    fn v2_enter_then_fail(resolver: &V2Resolver<'_>, schema: &Value) -> Result<()> {
+    fn v2_enter_then_fail(resolver: &V2Resolver<'_>, schema: &Value) -> Result<(), ()> {
         let _guard = resolver
             .enter(schema)
             .expect("schema should not already be expanding");
-        bail!("simulated early return")
+        Err(())
     }
 
     #[test]
