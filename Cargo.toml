@@ -3,7 +3,7 @@ name = "kubectl-ditto"
 version = "0.1.0"
 edition = "2024"
 description = "kubectl plugin to generate YAML for any resource/CRD using cluster schema and smart defaults"
-license = "Apache-2.0"
+license = "MIT"
 repository = "https://github.com/rawkode/kubectl-ditto"
 homepage = "https://github.com/rawkode/kubectl-ditto"
 
