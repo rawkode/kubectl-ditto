@@ -759,3 +759,207 @@ fn find_definition_key(candidates: &[String], resolved: &ResolvedResource) -> Re
         kind
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discovery::ResolvedApiResource;
+    use serde_json::json;
+
+    fn resolved_resource(group: &str, version: &str, kind: &str) -> ResolvedResource {
+        ResolvedResource {
+            api_resource: ResolvedApiResource {
+                kind: kind.to_string(),
+                plural: format!("{}s", kind.to_lowercase()),
+            },
+            namespaced: true,
+            group: group.to_string(),
+            version: version.to_string(),
+        }
+    }
+
+    fn field<'a>(fields: &'a [FieldSchema], name: &str) -> &'a FieldSchema {
+        fields.iter().find(|f| f.name == name).unwrap()
+    }
+
+    #[test]
+    fn find_definition_key_prefers_version_kind_suffix_match() {
+        let resolved = resolved_resource("apps", "v1", "Deployment");
+        let candidates = vec![
+            "io.k8s.api.core.v1.Service".to_string(),
+            "io.k8s.api.apps.v1.Deployment".to_string(),
+            "Deployment".to_string(),
+        ];
+
+        let key = find_definition_key(&candidates, &resolved).unwrap();
+
+        assert_eq!(key, "io.k8s.api.apps.v1.Deployment");
+    }
+
+    #[test]
+    fn find_definition_key_falls_back_to_kind_with_group_match() {
+        let resolved = resolved_resource("example.io", "v1alpha1", "Widget");
+        let candidates = vec![
+            "com.other.Widget".to_string(),
+            "com.example.io.Widget".to_string(),
+        ];
+
+        let key = find_definition_key(&candidates, &resolved).unwrap();
+
+        assert_eq!(key, "com.example.io.Widget");
+    }
+
+    #[test]
+    fn v2_parse_resource_resolves_refs_and_nested_types() {
+        let openapi = json!({
+            "definitions": {
+                "com.example.v1.Widget": {
+                    "description": "Widget resource.",
+                    "required": ["spec"],
+                    "properties": {
+                        "spec": { "$ref": "#/definitions/com.example.v1.WidgetSpec" },
+                        "mode": {
+                            "type": "string",
+                            "description": "Operating mode.",
+                            "default": "Active",
+                            "enum": ["Active", "Passive"]
+                        }
+                    }
+                },
+                "com.example.v1.WidgetSpec": {
+                    "type": "object",
+                    "required": ["replicas"],
+                    "properties": {
+                        "replicas": {
+                            "type": "integer",
+                            "format": "int32"
+                        },
+                        "labels": {
+                            "type": "object",
+                            "additionalProperties": { "type": "string" }
+                        },
+                        "ports": {
+                            "type": "array",
+                            "items": { "type": "integer" }
+                        }
+                    }
+                }
+            }
+        });
+        let resolver = V2Resolver {
+            root: &openapi,
+            expanding: RefCell::new(HashSet::new()),
+        };
+
+        let parsed = v2_parse_resource(&openapi["definitions"]["com.example.v1.Widget"], &resolver)
+            .unwrap();
+
+        assert_eq!(parsed.description.as_deref(), Some("Widget resource."));
+
+        let spec = field(&parsed.fields, "spec");
+        assert!(spec.required);
+        match &spec.field_type {
+            FieldType::Object(fields) => {
+                let replicas = field(fields, "replicas");
+                assert!(replicas.required);
+                assert!(matches!(replicas.field_type, FieldType::Integer));
+                assert_eq!(replicas.format.as_deref(), Some("int32"));
+
+                let labels = field(fields, "labels");
+                match &labels.field_type {
+                    FieldType::Map(Some(value)) => {
+                        assert_eq!(value.name, "value");
+                        assert!(matches!(value.field_type, FieldType::String));
+                    }
+                    other => panic!("expected string-valued map, got {other:?}"),
+                }
+
+                let ports = field(fields, "ports");
+                match &ports.field_type {
+                    FieldType::Array(item) => {
+                        assert_eq!(item.name, "items");
+                        assert!(matches!(item.field_type, FieldType::Integer));
+                    }
+                    other => panic!("expected integer array, got {other:?}"),
+                }
+            }
+            other => panic!("expected nested object, got {other:?}"),
+        }
+
+        let mode = field(&parsed.fields, "mode");
+        assert_eq!(mode.default, Some(Value::String("Active".to_string())));
+        assert_eq!(
+            mode.enum_values,
+            Some(vec![
+                Value::String("Active".to_string()),
+                Value::String("Passive".to_string())
+            ])
+        );
+    }
+
+    #[test]
+    fn v3_resource_schema_resolves_refs_and_additional_properties() {
+        let openapi: oa::OpenAPI = serde_json::from_value(json!({
+            "openapi": "3.0.0",
+            "info": { "title": "test", "version": "1.0.0" },
+            "paths": {},
+            "components": {
+                "schemas": {
+                    "com.example.v1.Widget": {
+                        "type": "object",
+                        "required": ["spec"],
+                        "properties": {
+                            "spec": { "$ref": "#/components/schemas/com.example.v1.WidgetSpec" }
+                        }
+                    },
+                    "com.example.v1.WidgetSpec": {
+                        "type": "object",
+                        "required": ["replicas"],
+                        "properties": {
+                            "replicas": {
+                                "type": "integer",
+                                "format": "int32",
+                                "description": "Replica count."
+                            },
+                            "labels": {
+                                "type": "object",
+                                "additionalProperties": { "type": "string" }
+                            }
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let components = openapi.components.as_ref().unwrap();
+        let ctx = Ctx {
+            schemas: &components.schemas,
+            expanding: RefCell::new(HashSet::new()),
+        };
+        let schema = ctx
+            .resolve_ref_or(components.schemas.get("com.example.v1.Widget").unwrap())
+            .unwrap();
+
+        let parsed = ctx.resource_schema(schema);
+
+        let spec = field(&parsed.fields, "spec");
+        assert!(spec.required);
+        match &spec.field_type {
+            FieldType::Object(fields) => {
+                let replicas = field(fields, "replicas");
+                assert!(replicas.required);
+                assert!(matches!(replicas.field_type, FieldType::Integer));
+                assert_eq!(replicas.description.as_deref(), Some("Replica count."));
+
+                let labels = field(fields, "labels");
+                match &labels.field_type {
+                    FieldType::Map(Some(value)) => {
+                        assert!(matches!(value.field_type, FieldType::String));
+                    }
+                    other => panic!("expected string-valued map, got {other:?}"),
+                }
+            }
+            other => panic!("expected nested object, got {other:?}"),
+        }
+    }
+}
