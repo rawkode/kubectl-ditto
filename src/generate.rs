@@ -476,3 +476,115 @@ fn first_sentence(desc: &str) -> &str {
         result
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_field(name: &str, required: bool) -> FieldSchema {
+        FieldSchema {
+            name: name.to_string(),
+            description: None,
+            field_type: FieldType::String,
+            required,
+            default: None,
+            enum_values: None,
+            variants: None,
+            format: None,
+        }
+    }
+
+    #[test]
+    fn filter_fields_minimal_keeps_only_required_fields() {
+        let fields = vec![test_field("name", true), test_field("image", false)];
+
+        let filtered = filter_fields(&fields, true, false);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "name");
+    }
+
+    #[test]
+    fn filter_fields_default_keeps_commonly_needed_fields() {
+        let fields = vec![test_field("image", false), test_field("debug", false)];
+
+        let filtered = filter_fields(&fields, false, false);
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "image");
+    }
+
+    #[test]
+    fn filter_fields_falls_back_to_all_fields_when_no_match() {
+        let fields = vec![test_field("debug", false), test_field("trace", false)];
+
+        let filtered = filter_fields(&fields, false, false);
+
+        assert_eq!(filtered.len(), 2);
+        assert_eq!(filtered[0].name, "debug");
+        assert_eq!(filtered[1].name, "trace");
+    }
+
+    #[test]
+    fn is_commonly_needed_matches_known_field_names() {
+        assert!(is_commonly_needed(&test_field("containers", false)));
+        assert!(!is_commonly_needed(&test_field("debug", false)));
+    }
+
+    #[test]
+    fn emit_yaml_renders_comments_arrays_and_maps() {
+        let yaml = emit_yaml(
+            &YamlNode::Object(vec![
+                (
+                    "metadata".into(),
+                    YamlNode::Object(vec![(
+                        "name".into(),
+                        YamlNode::Scalar("\"demo\"".into()),
+                        Some("Resource name.".into()),
+                    )]),
+                    Some("Resource metadata.".into()),
+                ),
+                (
+                    "spec".into(),
+                    YamlNode::Object(vec![(
+                        "containers".into(),
+                        YamlNode::Array(vec![YamlNode::Object(vec![
+                            (
+                                "name".into(),
+                                YamlNode::Scalar("\"app\"".into()),
+                                Some("Container name.".into()),
+                            ),
+                            (
+                                "env".into(),
+                                YamlNode::Array(vec![]),
+                                Some("Environment vars.".into()),
+                            ),
+                            (
+                                "config".into(),
+                                YamlNode::Map,
+                                Some("Free-form config.".into()),
+                            ),
+                        ])]),
+                        Some("Container list.".into()),
+                    )]),
+                    None,
+                ),
+            ]),
+            true,
+        );
+
+        assert_eq!(
+            yaml,
+            concat!(
+                "metadata:  # Resource metadata.\n",
+                "  name: \"demo\"  # Resource name.\n",
+                "spec:\n",
+                "  containers:  # Container list.\n",
+                "  - name: \"app\"  # Container name.\n",
+                "    env: []  # Environment vars.\n",
+                "    config:  # Free-form config.\n",
+                "      # key: value"
+            )
+        );
+    }
+}
