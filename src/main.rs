@@ -6,6 +6,27 @@ mod schema;
 
 use anyhow::Result;
 use clap::Parser;
+use kube::config::{KubeConfigOptions, Kubeconfig};
+
+async fn client_for_args(args: &cli::Args) -> Result<kube::Client> {
+    if args.kubeconfig.is_none() && args.context.is_none() {
+        return Ok(kube::Client::try_default().await?);
+    }
+
+    let options = KubeConfigOptions {
+        context: args.context.clone(),
+        ..Default::default()
+    };
+
+    let config = if let Some(path) = &args.kubeconfig {
+        let kubeconfig = Kubeconfig::read_from(path)?;
+        kube::Config::from_custom_kubeconfig(kubeconfig, &options).await?
+    } else {
+        kube::Config::from_kubeconfig(&options).await?
+    };
+
+    Ok(kube::Client::try_from(config)?)
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -19,7 +40,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    let client = kube::Client::try_default().await?;
+    let client = client_for_args(&args).await?;
 
     // 1. Resolve the resource type (dynamic short names from API server)
     let resolved = discovery::resolve_resource(&client, &resource).await?;

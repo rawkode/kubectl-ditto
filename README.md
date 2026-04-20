@@ -35,6 +35,9 @@ kubectl ditto deployment -n my-namespace my-app --full
 
 # Suppress description comments
 kubectl ditto deployment -n my-namespace my-app --no-comments
+
+# Use a specific kubeconfig or context
+kubectl ditto deployment my-app --kubeconfig ~/.kube/prod-config --context production
 ```
 
 ## Install
@@ -65,7 +68,7 @@ The binary `kubectl-ditto` is placed on your PATH. kubectl automatically discove
 
 ## Requirements
 
-- A running Kubernetes cluster (uses your current kubeconfig context)
+- A running Kubernetes cluster (uses your current kubeconfig context unless `--kubeconfig` or `--context` is provided)
 - CRDs must be installed for custom resources
 
 ## Release
