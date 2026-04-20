@@ -72,7 +72,7 @@ The binary `kubectl-ditto` is placed on your PATH. kubectl automatically discove
 
 To publish a new version:
 
-1. Tag: `git tag v0.2.0 && git push --tags`
+1. Tag: `git tag v0.2.2 && git push --tags`
 2. Build release binaries for each platform
-3. Update Krew manifest hashes: `./deploy/krew/update-sha256.sh v0.2.0`
+3. Update Krew manifest hashes: `./deploy/krew/update-sha256.sh v0.2.2`
 4. Submit PR to [krew-index](https://github.com/kubernetes-sigs/krew-index)
